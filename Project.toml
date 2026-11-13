@@ -1,0 +1,22 @@
+name = "MOS_amplifier_configurations"
+uuid = "97c0b0a4-0edd-47e8-a230-2da741dcc35e"
+authors = ["Chris Winstead"]
+version = "0.1.0"
+
+[deps]
+Microelectronics = "7558d6fc-9aaf-4343-9ca4-2cb62773acb1"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SchematicSVG = "fe0f8afc-60ab-40bb-850f-aaaf3f1447e3"
+
+[compat]
+Microelectronics = "1.4"
+Random = "1"
+SchematicSVG = "0.12.2"
+Test = "1"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22d-5e28-ae1b-0b8fc6b4c9d7"
+
+[targets]
+test = ["Test"]
