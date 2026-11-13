@@ -1,3 +1,7 @@
+# Run with:  julia --project=. -e 'using Pkg; Pkg.test()'
+# (or `julia --project=. test/runtests.jl`, which needs Test from the standard library)
+"@stdlib" in LOAD_PATH || push!(LOAD_PATH, "@stdlib")
+
 using MOS_amplifier_configurations, Microelectronics, SchematicSVG, Test
 
 @testset "MOS_amplifier_configurations" begin

@@ -408,11 +408,12 @@ function next_circuit()
     device, load, config = split(name, '_')
     (; RD, RS, ID, Vofs) = random_values(s, device, load, config)
     CC, RC = s.CC, s.RC
-    P1 = P2 = s.Pmodel
-    N1 = N2 = s.Nmodel
     amplitude, frequency = s.amplitude, s.frequency
-    Vsig = (; amplitude, frequency)
-    table = @table CC RC ID P1 P2 N1 N2 RD RS Vofs Vsig
+    # a plain Dict: Microelectronics' @table can't be used inside a package (it evals
+    # into Microelectronics while this package precompiles)
+    table = Dict("CC" => CC, "RC" => RC, "ID" => ID, "RD" => RD, "RS" => RS, "Vofs" => Vofs,
+                 "P1" => s.Pmodel, "P2" => s.Pmodel, "N1" => s.Nmodel, "N2" => s.Nmodel,
+                 "Vsig" => (; amplitude, frequency))
 
     elements = matching_elements(SCHEMATICS[name], table)
     schem = annotate(SCHEMATICS[name], elements)
