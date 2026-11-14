@@ -15,13 +15,16 @@ source and coupling.
 
 `next_circuit` steps through the circuits in a shuffled order (set by `seed`), draws
 random component values, and returns an [`AmplifierCircuit`](@ref) holding them with the
-annotated schematic and a Microelectronics netlist ready to simulate.
+annotated schematic and a Microelectronics netlist ready to simulate. `make_circuit`
+builds a named circuit with values you choose:
+
+    c = make_circuit("nmos_degen_cs"; RD=20u"kΩ", RS=500u"Ω")
 """
 module MOS_amplifier_configurations
 
 using Microelectronics, SchematicSVG, Random
 
-export next_circuit, set_parameters, circuit_list, AmplifierCircuit
+export next_circuit, make_circuit, set_parameters, circuit_list, AmplifierCircuit
 export complete_schematic, amplifier_configuration, bias_schematic
 export nmos_amplifier_topology, pmos_amplifier_topology
 
@@ -268,14 +271,15 @@ const CONFIG_NAMES = Dict("cs" => "common source", "cg" => "common gate",
 """
     AmplifierCircuit
 
-One circuit from [`next_circuit`](@ref): its name and place in the sequence, every
+One circuit from [`next_circuit`](@ref) or [`make_circuit`](@ref): its name and place
+in the sequence (`number` is 0 for `make_circuit`), every
 parameter value, the annotated schematic and a Microelectronics `Netlist`.
 
 Fields:
 
 - `name` (`"nmos_degen_cs"`, …), `device`, `load`, `config`; `number` of `total` in the
   sequence
-- `RD`, `RS`, `ID`, `Vofs`: the random values, or `nothing` for an element this circuit
+- `RD`, `RS`, `ID`, `Vofs`: the component values, or `nothing` for an element this circuit
   doesn't have
 - `VDD`, `VSS`, `RC`, `CC`, `model` (the transistor model), `amplitude`, `frequency`
 - `schematic`, `netlist`
@@ -325,8 +329,8 @@ function summary_lines(c::AmplifierCircuit)
 end
 
 summary_title(c::AmplifierCircuit) =
-    "$(c.name) ($(c.number) of $(c.total)): $(DEVICE_NAMES[c.device]) " *
-    "$(CONFIG_NAMES[c.config]), $(LOAD_NAMES[c.load])"
+    c.name * (c.number > 0 ? " ($(c.number) of $(c.total))" : "") *
+    ": $(DEVICE_NAMES[c.device]) $(CONFIG_NAMES[c.config]), $(LOAD_NAMES[c.load])"
 
 Base.show(io::IO, c::AmplifierCircuit) = print(io, "AmplifierCircuit(\"", c.name, "\")")
 
@@ -369,27 +373,91 @@ saturated) whenever RD/RS ≤ (V_DD - V_G)/(V_G - V_SS). PMOS is the mirror imag
 RD/RS ≤ (V_G - V_SS)/(V_DD - V_G). RD is drawn below 80% of that bound, in 100 Ω steps,
 and no more than 50 kΩ. The bound holds for any enhancement-mode model, so changing the
 models or supplies with `set_parameters` doesn't break it. =#
-function random_values(s::Settings, device, load, config)
-    rng = s.rng
-    VDD, VSS = s.supplies["vdd"], s.supplies["vss"]
+function random_values(rng, device, load, config, VDD, VSS)
     RD = rand(rng, 10:50) * u"kΩ"
     RS = rand(rng, 50:1000) * u"Ω"
     ID = rand(rng, 100:500) * u"μA"
     steps = floor(Int, ustrip(u"V", VDD - VSS - 3u"V") / 0.5)
     steps >= 0 || error("V_DD - V_SS must be at least 3 V")
     Vofs = uconvert(u"V", VSS + 1.5u"V" + 0.5u"V" * rand(rng, 0:steps))
-    if config == "sf"
-        RS = rand(rng, 5:50) * u"kΩ"
-        if load == "degen"
-            ratio = device == "nmos" ? (VDD - Vofs) / (Vofs - VSS) :
-                                       (Vofs - VSS) / (VDD - Vofs)
-            limit = 0.8 * uconvert(NoUnits, ratio) * ustrip(u"Ω", RS)    # in Ω
-            n = min(floor(Int, limit / 100), 500)
-            RD = n >= 1 ? uconvert(u"kΩ", rand(rng, 1:n) * 100u"Ω") :
-                          floor(Int, limit) * u"Ω"                  # only with tight supplies
-        end
-    end
+    config == "sf" && (RS = rand(rng, 5:50) * u"kΩ")
     (; RD, RS, ID, Vofs)
+end
+
+# The largest RD/RS that keeps a degenerated source follower saturated (see above)
+rd_rs_bound(device, VDD, VSS, VG) = uconvert(NoUnits,
+    device == "nmos" ? (VDD - VG) / (VG - VSS) : (VG - VSS) / (VDD - VG))
+
+# A random RD for a degenerated source follower, below 80% of that bound
+function random_degen_RD(rng, device, VDD, VSS, Vofs, RS)
+    limit = 0.8 * rd_rs_bound(device, VDD, VSS, Vofs) * ustrip(u"Ω", RS)    # in Ω
+    n = min(floor(Int, limit / 100), 500)
+    n >= 1 ? uconvert(u"kΩ", rand(rng, 1:n) * 100u"Ω") :
+             max(floor(Int, limit), 0) * u"Ω"                     # only with tight supplies
+end
+
+# Plain numbers are taken to be in SI units: RD=20e3 is 20 kΩ.
+withunit(x, unit) = x isa Real ? x * unit : x
+
+# Builds one circuit. `values` are the ones chosen by the caller (`nothing`: random).
+function assemble(name, rng, number, total; RD, RS, ID, Vofs, VDD, VSS, RC, CC, model,
+                  amplitude, frequency)
+    name = string(name)
+    haskey(SCHEMATICS, name) ||
+        throw(ArgumentError("no circuit \"$name\"; circuit_list() gives the names"))
+    device, load, config = split(name, '_')
+    RD, RS = withunit(RD, u"Ω"), withunit(RS, u"Ω")
+    ID, Vofs = withunit(ID, u"A"), withunit(Vofs, u"V")
+    VDD, VSS = withunit(VDD, u"V"), withunit(VSS, u"V")
+    RC, CC = withunit(RC, u"Ω"), withunit(CC, u"F")
+    amplitude, frequency = withunit(amplitude, u"V"), withunit(frequency, u"Hz")
+    chosen = (; RD, RS, ID, Vofs)
+
+    # random values, in the same order every time, for whatever wasn't chosen
+    r = random_values(rng, device, load, config, VDD, VSS)
+    RS = something(RS, r.RS)
+    ID = something(ID, r.ID)
+    Vofs = something(Vofs, r.Vofs)
+    if RD === nothing
+        RD = config == "sf" && load == "degen" ?
+             random_degen_RD(rng, device, VDD, VSS, Vofs, RS) : r.RD
+    elseif config == "sf" && load == "degen" &&
+           uconvert(NoUnits, RD / RS) > rd_rs_bound(device, VDD, VSS, Vofs)
+        @warn "$name: RD = $RD with RS = $RS and Vofs = $Vofs may put the transistor " *
+              "in triode (it is sure to be saturated for RD/RS ≤ " *
+              "$(round(rd_rs_bound(device, VDD, VSS, Vofs), sigdigits=3)))"
+    end
+
+    supplies = Dict("vdd" => VDD, "vss" => VSS)
+    # a plain Dict: Microelectronics' @table can't be used inside a package (it evals
+    # into Microelectronics while this package precompiles)
+    table = Dict("CC" => CC, "RC" => RC, "ID" => ID, "RD" => RD, "RS" => RS, "Vofs" => Vofs,
+                 "P1" => model, "P2" => model, "N1" => model, "N2" => model,
+                 "Vsig" => (; amplitude, frequency))
+
+    elements = matching_elements(SCHEMATICS[name], table)
+    schem = annotate(SCHEMATICS[name], elements)
+    netmodel = to_microelectronics(schem; supplies)
+    # Vsig: its last waveform becomes a plain sine at the set amplitude and frequency
+    i = findfirst(x -> x.name == "Vsig", netmodel.sources)
+    if i !== nothing
+        vsig = netmodel.sources[i]
+        isempty(vsig.waveforms) || pop!(vsig.waveforms)
+        push!(vsig.waveforms, Waveform(:sin; amplitude, frequency))
+    end
+    netlist = Netlist(; title=name, netmodel.components, netmodel.sources)
+
+    # values of elements this circuit has; `nothing` for the others
+    drawn = Set(replace(k, r"_\d+$" => "") for k in keys(elements))
+    for (key, value) in pairs(chosen)
+        value === nothing || string(key) in drawn ||
+            @warn "$name has no $key; the value given for it is ignored"
+    end
+    ifdrawn(key, value) = key in drawn ? value : nothing
+    AmplifierCircuit(name, device, load, config, number, total,
+                     ifdrawn("RD", RD), ifdrawn("RS", RS), ifdrawn("ID", ID),
+                     ifdrawn("Vofs", Vofs), VDD, VSS, RC, CC, model, amplitude, frequency,
+                     schem, netlist)
 end
 
 """
@@ -398,43 +466,54 @@ end
 The next circuit in the shuffled sequence (it starts over after the last one), with
 random values for RD, RS, ID and the offset voltage Vofs, the annotated schematic and a
 Microelectronics `Netlist` ready to simulate. See [`AmplifierCircuit`](@ref) for the
-fields. `set_parameters` restarts the sequence.
+fields. `set_parameters` restarts the sequence. For a particular circuit, or particular
+values, use [`make_circuit`](@ref).
 """
 function next_circuit()
     s = SETTINGS[]
     s.index = mod1(s.index + 1, length(s.order))
     name = s.order[s.index]
+    assemble(name, s.rng, s.index, length(s.order);
+             RD=nothing, RS=nothing, ID=nothing, Vofs=nothing, settings_values(s, name)...)
+end
 
-    device, load, config = split(name, '_')
-    (; RD, RS, ID, Vofs) = random_values(s, device, load, config)
-    CC, RC = s.CC, s.RC
-    amplitude, frequency = s.amplitude, s.frequency
-    # a plain Dict: Microelectronics' @table can't be used inside a package (it evals
-    # into Microelectronics while this package precompiles)
-    table = Dict("CC" => CC, "RC" => RC, "ID" => ID, "RD" => RD, "RS" => RS, "Vofs" => Vofs,
-                 "P1" => s.Pmodel, "P2" => s.Pmodel, "N1" => s.Nmodel, "N2" => s.Nmodel,
-                 "Vsig" => (; amplitude, frequency))
+# set_parameters' values for circuit `name`
+settings_values(s::Settings, name) =
+    (; VDD=s.supplies["vdd"], VSS=s.supplies["vss"], s.RC, s.CC,
+       model=startswith(name, "nmos") ? s.Nmodel : s.Pmodel, s.amplitude, s.frequency)
 
-    elements = matching_elements(SCHEMATICS[name], table)
-    schem = annotate(SCHEMATICS[name], elements)
-    model = to_microelectronics(schem; supplies=s.supplies)
-    # Vsig: its last waveform becomes a plain sine at the set amplitude and frequency
-    i = findfirst(x -> x.name == "Vsig", model.sources)
-    if i !== nothing
-        vsig = model.sources[i]
-        isempty(vsig.waveforms) || pop!(vsig.waveforms)
-        push!(vsig.waveforms, Waveform(:sin; amplitude, frequency))
-    end
-    netlist = Netlist(; title=name, model.components, model.sources)
+"""
+    make_circuit(name; RD, RS, ID, Vofs, VDD, VSS, RC, CC, model, amplitude, frequency,
+                 rng=Random.default_rng()) -> AmplifierCircuit
+    make_circuit(c::AmplifierCircuit; kw...) -> AmplifierCircuit
 
-    # values of elements this circuit has; `nothing` for the others
-    drawn = Set(replace(k, r"_\d+$" => "") for k in keys(elements))
-    ifdrawn(key, value) = key in drawn ? value : nothing
-    AmplifierCircuit(name, device, load, config, s.index, length(s.order),
-                     ifdrawn("RD", RD), ifdrawn("RS", RS), ifdrawn("ID", ID),
-                     ifdrawn("Vofs", Vofs), s.supplies["vdd"], s.supplies["vss"], RC, CC,
-                     device == "nmos" ? s.Nmodel : s.Pmodel, amplitude, frequency,
-                     schem, netlist)
+The circuit `name` (see [`circuit_list`](@ref)) with the values you give, as an
+[`AmplifierCircuit`](@ref) with its annotated schematic and netlist, for a worked example
+or a particular problem:
+
+    c = make_circuit("nmos_degen_cs"; RD=20u"kΩ", RS=500u"Ω")
+    c = make_circuit("pmos_passive_sf"; RS=10e3, Vofs=1)   # plain numbers are SI units
+
+`RD`, `RS`, `ID` and `Vofs` that you leave out are random, from the same ranges as
+`next_circuit` (so the transistor stays saturated), drawn from `rng`; pass
+`rng=Xoshiro(seed)` to repeat them. The supplies, coupling, transistor `model` and signal
+default to those of [`set_parameters`](@ref). A value for an element the circuit doesn't
+have is ignored, with a warning, and so is `next_circuit`'s sequence: it doesn't move.
+
+The second form makes a copy of `c` with some values changed:
+
+    c2 = make_circuit(c; RD=33u"kΩ")
+"""
+function make_circuit(name; RD=nothing, RS=nothing, ID=nothing, Vofs=nothing,
+                      rng=Random.default_rng(), kw...)
+    defaults = settings_values(SETTINGS[], string(name))
+    assemble(name, rng, 0, 0; RD, RS, ID, Vofs, merge(defaults, values(kw))...)
+end
+
+function make_circuit(c::AmplifierCircuit; kw...)
+    given = (; c.RD, c.RS, c.ID, c.Vofs, c.VDD, c.VSS, c.RC, c.CC, c.model,
+               c.amplitude, c.frequency)
+    make_circuit(c.name; merge(given, values(kw))...)
 end
 
 """Names of all circuits, e.g. `"nmos_ideal_cs"`, sorted."""
